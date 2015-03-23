@@ -5,6 +5,8 @@
 #include <sstream>
 #include <glog/logging.h>
 
+#include <thread>
+
 #include "server/messages.h"
 #include "server/worker.h"
 #include "tools/cycle_timer.h"
@@ -45,7 +47,6 @@ static void execute_compareprimes(const Request_msg& req, Response_msg& resp) {
       resp.set_response("There are more primes in second range.");
 }
 
-
 void worker_node_init(const Request_msg& params) {
 
   // This is your chance to initialize your worker.  For example, you
@@ -57,8 +58,7 @@ void worker_node_init(const Request_msg& params) {
 
 }
 
-void worker_handle_request(const Request_msg& req) {
-
+void do_work(const Request_msg& req) {
   // Make the tag of the reponse match the tag of the request.  This
   // is a way for your master to match worker responses to requests.
   Response_msg resp(req.get_tag());
@@ -72,7 +72,7 @@ void worker_handle_request(const Request_msg& req) {
   if (req.get_arg("cmd").compare("compareprimes") == 0) {
 
     // The compareprimes command needs to be special cased since it is
-    // built on four calls to execute_execute work.  All other
+    // built on four calls to execute_work.  All other
     // requests from the client are one-to-one with calls to
     // execute_work.
 
@@ -91,4 +91,11 @@ void worker_handle_request(const Request_msg& req) {
 
   // send a response string to the master
   worker_send_response(resp);
+}
+
+void worker_handle_request(const Request_msg& req) {
+  Request_msg* req2 = new Request_msg();
+  *req2 = req;
+  std::thread thread(do_work, *req2);
+  thread.detach();
 }
