@@ -5,8 +5,6 @@
 #include <sstream>
 #include <glog/logging.h>
 
-#include <future>
-
 #include "server/messages.h"
 #include "server/worker.h"
 #include "tools/cycle_timer.h"
@@ -21,14 +19,6 @@ static struct Worker_state {
 
   threadpool::pool tp;
 } wstate;
-
-// Generate a valid 'countprimes' request dictionary from integer 'n'
-static void create_computeprimes_req(Request_msg& req, int n) {
-  std::ostringstream oss;
-  oss << n;
-  req.set_arg("cmd", "countprimes");
-  req.set_arg("n", oss.str());
-}
 
 void worker_node_init(const Request_msg& params) {
 
