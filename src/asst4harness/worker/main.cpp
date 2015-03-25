@@ -97,6 +97,10 @@ void harness_begin_main_loop() {
     // student code
     worker_handle_request(req);
   }
+
+  char worker_hostname[1024];
+  gethostname(worker_hostname, 1023);
+  DLOG(INFO) << "Worker on " << worker_hostname << " is shutting down (master terminated connection)" << std::endl;
 }
 
 void worker_send_response(const Response_msg& resp) {
