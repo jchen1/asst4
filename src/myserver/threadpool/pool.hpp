@@ -1,3 +1,5 @@
+// NOTE: I (jchen4) wrote this. See github.com/iambald/threadpool
+
 #ifndef THREADPOOL_POOL_H
 #define THREADPOOL_POOL_H
 

@@ -61,7 +61,7 @@ ifneq ($(strip $(LIBS_NOTFOUND)),)
 endif
 
 CXX=g++
-CXXFLAGS+=-Wall -Wextra -O2 -std=c++11
+CXXFLAGS+=-Wall -Wextra -O2 -std=c++11 -fdiagnostics-color
 CPPFLAGS+=-I$(CURDIR)/src/asst4harness -I$(CURDIR)/src/asst4include $(foreach lib,$(LIBS), $(shell $(PKGCONFIG) --cflags $(lib)))
 LDFLAGS+=-lpthread $(foreach lib,$(LIBS), $(shell $(PKGCONFIG) --libs $(lib))) -Xlinker -rpath -Xlinker external_lib
 
