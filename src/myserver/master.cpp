@@ -224,7 +224,8 @@ void handle_client_request(Client_handle client_handle, const Request_msg& clien
     params[2] = atoi(client_req.get_arg("n3").c_str());
     params[3] = atoi(client_req.get_arg("n4").c_str());
 
-    for (int i=0; i<4; i++, tag++) {
+    for (int i=0; i<4; i++) {
+      tag++;
       if (mstate.primes.count(params[i]) == 0) {
         uncached++;
         Request_msg dummy_req(tag);
