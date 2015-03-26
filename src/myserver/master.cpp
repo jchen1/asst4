@@ -2,6 +2,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include <algorithm>
+#include <functional>
 #include <tuple>
 #include <unordered_map>
 #include <queue>
@@ -9,6 +11,18 @@
 #include "server/messages.h"
 #include "server/master.h"
 #include "tools/cycle_timer.h"
+
+static bool compare_request_priorities(Request_msg a, Request_msg b) {
+  if (a.get_arg("cmd") == "tellmenow" && b.get_arg("cmd") != "tellmenow") {
+    return true;
+  }
+  else if (a.get_arg("cmd") != "tellmenow" && b.get_arg("cmd") == "tellmenow") {
+    return false;
+  }
+
+  return (a.get_tag() > b.get_tag());
+}
+
 
 static struct Master_state {
 
@@ -24,14 +38,22 @@ static struct Master_state {
   float incoming_rate;
   float outgoing_rate;
 
-  // tag -> (client handle, request timestamp, request type)
+  // tag -> (client handle, request timestamp, request)
   std::unordered_map<int, std::tuple<Client_handle, float, Request_msg> > clients;
 
   // A simple cache for countprimes (and compareprimes) requests
   std::unordered_map<int, int> primes;
 
-  std::queue<Worker_handle> cpu_queue;
-  std::queue<Worker_handle> mem_queue;
+  // Request priority queue - prioritize tellmenow requests
+  std::priority_queue<Request_msg,
+                      std::vector<Request_msg>,
+                      decltype(&compare_request_priorities)> request_cpu_queue;
+
+  // Regular queue for memory requests
+  std::queue<Request_msg> request_mem_queue;
+
+  // Vector of tuple (worker, pending cpu requests, pending mem requests)
+  std::vector<std::tuple<Worker_handle, int, int>> workers;
 } mstate;
 
 
@@ -58,7 +80,7 @@ void calc_and_send_compareprimes(Client_handle client_handle, const Request_msg&
   DLOG(INFO) << "Fulfilling compareprimes request " << client_req.get_tag() << ": (" << params[0] << ", " << params[1] << ", " << params[2] << ", " << params[3] << ")\n";
 
   for (int i = 0; i < 4; i++) {
-    counts[i] = mstate.primes[params[i]];
+    counts[i] = mstate.primes.at(params[i]);
   }
 
   if (counts[1]-counts[0] > counts[3]-counts[2])
@@ -87,6 +109,10 @@ void master_node_init(int max_workers, int& tick_period) {
   // when 'master_node_init' returnes
   mstate.server_ready = false;
 
+  mstate.request_cpu_queue =  std::priority_queue<Request_msg,
+                              std::vector<Request_msg>,
+                              decltype(&compare_request_priorities)>(&compare_request_priorities);
+
   // fire off a request for a new worker
   for (int i = 0; i < max_workers; i++) {
     int tag = random();
@@ -97,20 +123,50 @@ void master_node_init(int max_workers, int& tick_period) {
 
 }
 
+// Returns a reference to the best worker tuple, so we can modify its task counts
+std::tuple<Worker_handle, int, int>& get_best_worker(bool memory_intensive) {
+  auto comparator = [&](std::tuple<Worker_handle, int, int> a, std::tuple<Worker_handle, int, int> b) {
+    if (memory_intensive) {
+      return std::get<2>(a) < std::get<2>(b);
+    }
+    else {
+      return std::get<1>(a) < std::get<1>(b);
+    }
+  };
 
-Worker_handle get_best_worker(bool memory_intensive) {
-  Worker_handle worker;
-  if (memory_intensive) {
-    worker = mstate.mem_queue.front();
-    mstate.mem_queue.pop();
-    mstate.mem_queue.push(worker);
+  return *std::min_element(std::begin(mstate.workers), std::end(mstate.workers), comparator);
+}
+
+#define MAX_MEM_REQUESTS 2
+#define MAX_CPU_REQUESTS 32
+
+void route_request(const Request_msg& request) {
+  // if free workers, assign them
+  // else, add it to the queue
+  auto& worker_tuple = get_best_worker(request.get_arg("cmd") == "projectidea");
+  auto worker_handle = std::get<0>(worker_tuple);
+
+  if (request.get_arg("cmd") == "projectidea") {
+    int current_requests = std::get<2>(worker_tuple);
+    if (current_requests >= MAX_MEM_REQUESTS) {
+      mstate.request_mem_queue.push(request);
+    }
+    else {
+      send_request_to_worker(worker_handle, request);
+      std::get<2>(worker_tuple)++;
+    }
   }
   else {
-    worker = mstate.cpu_queue.front();
-    mstate.cpu_queue.pop();
-    mstate.cpu_queue.push(worker);
+    int current_requests = std::get<1>(worker_tuple) + std::get<2>(worker_tuple);
+    if (current_requests >= MAX_CPU_REQUESTS) {
+      mstate.request_cpu_queue.push(request);
+    }
+    else {
+      send_request_to_worker(worker_handle, request);
+      std::get<1>(worker_tuple)++;
+    }
   }
-  return worker;
+
 }
 
 void handle_new_worker_online(Worker_handle worker_handle, int tag) {
@@ -119,13 +175,12 @@ void handle_new_worker_online(Worker_handle worker_handle, int tag) {
   // corresponds to.  Since the starter code only sends off one new
   // worker request, we don't use it here.
 
-  mstate.cpu_queue.push(worker_handle);
-  mstate.mem_queue.push(worker_handle);
+  mstate.workers.push_back(std::make_tuple(worker_handle, 0, 0));
 
   // Now that a worker is booted, let the system know the server is
   // ready to begin handling client requests.  The test harness will
   // now start its timers and start hitting your server with requests.
-  if (mstate.server_ready == false && mstate.cpu_queue.size() == (unsigned int) mstate.max_workers) {
+  if (mstate.server_ready == false && mstate.workers.size() == (unsigned int) mstate.max_workers) {
     mstate.server_ready = true;
     server_init_complete();
   }
@@ -144,6 +199,29 @@ void handle_worker_response(Worker_handle worker_handle, const Response_msg& res
   float request_time;
   Request_msg request;
   std::tie(waiting_client, request_time, request) = mstate.clients.at(tag);
+
+  auto& worker_tuple = *(std::find_if(std::begin(mstate.workers), std::end(mstate.workers), [&](decltype(*std::begin(mstate.workers)) tuple) {
+    return std::get<0>(tuple) == worker_handle;
+  }));
+
+  if (request.get_arg("cmd") == "projectidea") {
+    std::get<2>(worker_tuple)--;
+    if (!mstate.request_mem_queue.empty()) {
+      auto new_request = mstate.request_mem_queue.front();
+      mstate.request_mem_queue.pop();
+
+      route_request(new_request);
+    }
+  }
+  else {
+    std::get<1>(worker_tuple)--;
+    if (!mstate.request_cpu_queue.empty()) {
+      auto new_request = mstate.request_cpu_queue.top();
+      mstate.request_cpu_queue.pop();
+
+      route_request(new_request);
+    }
+  }
 
   if (request.get_arg("cmd") == "countprimes") {
     int ans = atoi(resp.get_response().c_str());
@@ -176,6 +254,10 @@ void handle_worker_response(Worker_handle worker_handle, const Response_msg& res
     send_client_response(waiting_client, resp);
 
   }
+  else if (request.get_arg("cmd") == "projectidea") {
+    send_client_response(waiting_client, resp);
+    mstate.clients.erase(tag);
+  }
   else {
     send_client_response(waiting_client, resp);
     mstate.clients.erase(tag);
@@ -185,8 +267,6 @@ void handle_worker_response(Worker_handle worker_handle, const Response_msg& res
 }
 
 void handle_client_request(Client_handle client_handle, const Request_msg& client_req) {
-
-  DLOG(INFO) << "Received request: " << client_req.get_request_string() << std::endl;
 
   // You can assume that traces end with this special message.  It
   // exists because it might be useful for debugging to dump
@@ -208,8 +288,14 @@ void handle_client_request(Client_handle client_handle, const Request_msg& clien
     tag = tag + 4 - ((tag - 1) % 5);
     mstate.next_tag = tag + 5;
   }
+
+  DLOG(INFO) << "Received request[" << tag << "]: " << client_req.get_request_string() << std::endl;
+
+
+  Request_msg worker_req(tag, client_req);
+
   mstate.clients.insert(std::make_pair(tag,
-    std::tuple<Client_handle, float, Request_msg>(client_handle, time, Request_msg(tag, client_req))));
+    std::tuple<Client_handle, float, Request_msg>(client_handle, time, worker_req)));
 
   // Fire off the request to the worker.  Eventually the worker will
   // respond, and your 'handle_worker_response' event handler will be
@@ -224,13 +310,16 @@ void handle_client_request(Client_handle client_handle, const Request_msg& clien
     params[2] = atoi(client_req.get_arg("n3").c_str());
     params[3] = atoi(client_req.get_arg("n4").c_str());
 
-    for (int i=0; i<4; i++, tag++) {
+    for (int i=0; i<4; i++) {
+      tag++;
       if (mstate.primes.count(params[i]) == 0) {
         uncached++;
         Request_msg dummy_req(tag);
         create_computeprimes_req(dummy_req, params[i]);
+        route_request(dummy_req);
 
-        send_request_to_worker(get_best_worker(false), dummy_req);
+
+        // send_request_to_worker(get_best_worker(false), dummy_req);
         mstate.clients.insert(std::make_pair(tag,
           std::tuple<Client_handle, float, Request_msg>(client_handle, time, dummy_req)));
       }
@@ -243,8 +332,7 @@ void handle_client_request(Client_handle client_handle, const Request_msg& clien
   } else if (client_req.get_arg("cmd") == "countprimes") {
     int param = atoi(client_req.get_arg("n").c_str());
     if (mstate.primes.count(param) == 0) {
-      Request_msg worker_req(tag, client_req);
-      send_request_to_worker(get_best_worker(false), worker_req);
+      route_request(worker_req);
     }
     else {
       Response_msg resp(client_req.get_tag());
@@ -252,14 +340,11 @@ void handle_client_request(Client_handle client_handle, const Request_msg& clien
       sprintf(tmp_buffer, "%d", mstate.primes.at(param));
       resp.set_response(tmp_buffer);
       send_client_response(client_handle, resp);
-
     }
   } else if (client_req.get_arg("cmd") == "projectidea") {
-    Request_msg worker_req(tag, client_req);
-    send_request_to_worker(get_best_worker(true), worker_req);
+    route_request(worker_req);
   } else {
-    Request_msg worker_req(tag, client_req);
-    send_request_to_worker(get_best_worker(false), worker_req);
+    route_request(worker_req);
   }
 
   // We're done!  This event handler now returns, and the master
@@ -270,6 +355,8 @@ void handle_client_request(Client_handle client_handle, const Request_msg& clien
 
 
 void handle_tick() {
+
+  // DLOG(INFO) << "Current queue sizes: CPU " << mstate.request_cpu_queue.size() << " MEM " << mstate.request_mem_queue.size() << std::endl;
 
   // TODO: you may wish to take action here.  This method is called at
   // fixed time intervals, according to how you set 'tick_period' in
