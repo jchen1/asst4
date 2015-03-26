@@ -30,7 +30,7 @@ class pool
    * std::thread::hardware_concurrency(), which should return the number of
    * physical cores the CPU has, start_paused = false, and idle_time = 1000.
    */
-  pool(unsigned int max_threads = std::thread::hardware_concurrency(),
+  pool(unsigned int max_threads = 32,//std::thread::hardware_concurrency(),
        unsigned int idle_time = 0)
     : max_threads(max_threads),
       idle_time(idle_time),
