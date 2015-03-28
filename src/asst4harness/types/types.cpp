@@ -37,6 +37,9 @@ std::ostream& operator<< (std::ostream &out, const message_t &message) {
     case SHUTDOWN:
       out << "SHUTDOWN";
       break;
+    case WORKER_UP_TIME_STATS:
+      out << "WORKER_UP_TIME_STATS";
+      break;
     default:
       LOG(FATAL) << "Invalid message " << std::hex << static_cast<int>(message);
   }

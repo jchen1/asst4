@@ -3,6 +3,7 @@
 import argparse
 import comm
 import datetime
+import errno
 import json
 import os
 import socket
@@ -120,10 +121,22 @@ conn_pool = ConnectionPool(args.address)
 ######################################################################
 
 print "Waiting for server to initialize...";
+
+# wait for someone to be listening on the port
+while True:
+  try:
+    socket.create_connection(args.address).close()
+    break
+  except socket.error as (num, msg):
+      # only ignore no one listening on the other end
+      if num != errno.ECONNREFUSED:
+          raise
+  time.sleep(0.1)
+
 server_ready = False
 while not server_ready:
   sock = conn_pool.get_conn()
-  
+
   comm.TaggedMessage(comm.ISREADY, 0).to_socket(sock)
   comm.TaggedMessage.from_socket(sock)
   resp = comm.recv_string(sock)
