@@ -12,6 +12,11 @@
 #include "server/master.h"
 #include "tools/cycle_timer.h"
 
+using worker_t = std::tuple<Worker_handle, int, int, bool>;
+
+#define MAX_MEM_REQUESTS 2
+#define MAX_CPU_REQUESTS 32
+
 static bool compare_request_priorities(Request_msg a, Request_msg b) {
   if (a.get_arg("cmd") == "tellmenow" && b.get_arg("cmd") != "tellmenow") {
     return true;
@@ -32,7 +37,7 @@ static struct Master_state {
   // code.
 
   bool server_ready;
-  int max_workers;
+  int min_workers, max_workers;
   int next_tag;
 
   float incoming_rate;
@@ -44,16 +49,19 @@ static struct Master_state {
   // A simple cache for countprimes (and compareprimes) requests
   std::unordered_map<int, int> primes;
 
-  // Request priority queue - prioritize tellmenow requests
+  // Request priority queue - prioritize tellmenow requests, then sort by tag
   std::priority_queue<Request_msg,
                       std::vector<Request_msg>,
                       decltype(&compare_request_priorities)> request_cpu_queue;
 
-  // Regular queue for memory requests
-  std::queue<Request_msg> request_mem_queue;
+  // Priority queue for memory requests: always sort by tag
+  std::priority_queue<Request_msg,
+                      std::vector<Request_msg>,
+                      decltype(&compare_request_priorities)> request_mem_queue;
 
-  // Vector of tuple (worker, pending cpu requests, pending mem requests)
-  std::vector<std::tuple<Worker_handle, int, int>> workers;
+  // Vector of tuple (worker, pending cpu requests, pending mem requests, worker dying)
+  std::vector<worker_t> workers;
+
 } mstate;
 
 
@@ -79,9 +87,9 @@ void calc_and_send_compareprimes(Client_handle client_handle, const Request_msg&
 
   DLOG(INFO) << "Fulfilling compareprimes request " << client_req.get_tag() << ": (" << params[0] << ", " << params[1] << ", " << params[2] << ", " << params[3] << ")\n";
 
-  for (int i = 0; i < 4; i++) {
-    counts[i] = mstate.primes.at(params[i]);
-  }
+  std::transform(params, params + 4, counts, [&](const int param) {
+    return mstate.primes.at(param);
+  });
 
   if (counts[1]-counts[0] > counts[3]-counts[2])
     response.set_response("There are more primes in first range.");
@@ -100,6 +108,7 @@ void master_node_init(int max_workers, int& tick_period) {
   tick_period = 2;
 
   mstate.next_tag = 0;
+  mstate.min_workers = 1;
   mstate.max_workers = max_workers;
   mstate.incoming_rate = 0.0f;
   mstate.outgoing_rate = 0.0f;
@@ -113,19 +122,26 @@ void master_node_init(int max_workers, int& tick_period) {
                               std::vector<Request_msg>,
                               decltype(&compare_request_priorities)>(&compare_request_priorities);
 
+  mstate.request_mem_queue =  std::priority_queue<Request_msg,
+                              std::vector<Request_msg>,
+                              decltype(&compare_request_priorities)>(&compare_request_priorities);
+
   // fire off a request for a new worker
-  for (int i = 0; i < max_workers; i++) {
-    int tag = random();
-    Request_msg req(tag);
-    req.set_arg("name", "my worker");
-    request_new_worker_node(req);
-  }
+  int tag = random();
+  Request_msg req(tag);
+  req.set_arg("name", "my worker");
+  request_new_worker_node(req);
 
 }
 
 // Returns a reference to the best worker tuple, so we can modify its task counts
-std::tuple<Worker_handle, int, int>& get_best_worker(bool memory_intensive) {
-  auto comparator = [&](std::tuple<Worker_handle, int, int> a, std::tuple<Worker_handle, int, int> b) {
+worker_t& get_best_worker(bool memory_intensive) {
+  auto comparator = [&](worker_t a, worker_t b) {
+
+    // If either of the workers is dying, return the live one
+    if (std::get<3>(a) && !std::get<3>(b)) return false;
+    else if (std::get<3>(b) && !std::get<3>(a)) return true;
+
     if (memory_intensive) {
       return std::get<2>(a) < std::get<2>(b);
     }
@@ -137,9 +153,6 @@ std::tuple<Worker_handle, int, int>& get_best_worker(bool memory_intensive) {
   return *std::min_element(std::begin(mstate.workers), std::end(mstate.workers), comparator);
 }
 
-#define MAX_MEM_REQUESTS 2
-#define MAX_CPU_REQUESTS 32
-
 void route_request(const Request_msg& request) {
   // if free workers, assign them
   // else, add it to the queue
@@ -148,7 +161,7 @@ void route_request(const Request_msg& request) {
 
   if (request.get_arg("cmd") == "projectidea") {
     int current_requests = std::get<2>(worker_tuple);
-    if (current_requests >= MAX_MEM_REQUESTS) {
+    if (current_requests >= MAX_MEM_REQUESTS || std::get<3>(worker_tuple)) {
       mstate.request_mem_queue.push(request);
     }
     else {
@@ -158,7 +171,7 @@ void route_request(const Request_msg& request) {
   }
   else {
     int current_requests = std::get<1>(worker_tuple) + std::get<2>(worker_tuple);
-    if (current_requests >= MAX_CPU_REQUESTS) {
+    if (current_requests >= MAX_CPU_REQUESTS || std::get<3>(worker_tuple)) {
       mstate.request_cpu_queue.push(request);
     }
     else {
@@ -175,12 +188,12 @@ void handle_new_worker_online(Worker_handle worker_handle, int tag) {
   // corresponds to.  Since the starter code only sends off one new
   // worker request, we don't use it here.
 
-  mstate.workers.push_back(std::make_tuple(worker_handle, 0, 0));
+  mstate.workers.push_back(std::make_tuple(worker_handle, 0, 0, false));
 
   // Now that a worker is booted, let the system know the server is
   // ready to begin handling client requests.  The test harness will
   // now start its timers and start hitting your server with requests.
-  if (mstate.server_ready == false && mstate.workers.size() == (unsigned int) mstate.max_workers) {
+  if (mstate.server_ready == false) {
     mstate.server_ready = true;
     server_init_complete();
   }
@@ -189,9 +202,6 @@ void handle_new_worker_online(Worker_handle worker_handle, int tag) {
 void handle_worker_response(Worker_handle worker_handle, const Response_msg& resp) {
 
   int tag = resp.get_tag();
-
-  // Master node has received a response from one of its workers.
-  // Here we directly return this response to the client.
 
   DLOG(INFO) << "Master received a response from a worker: [" << tag << ":" << resp.get_response() << "]" << std::endl;
 
@@ -204,10 +214,11 @@ void handle_worker_response(Worker_handle worker_handle, const Response_msg& res
     return std::get<0>(tuple) == worker_handle;
   }));
 
+  // If there is
   if (request.get_arg("cmd") == "projectidea") {
     std::get<2>(worker_tuple)--;
     if (!mstate.request_mem_queue.empty()) {
-      auto new_request = mstate.request_mem_queue.front();
+      auto new_request = mstate.request_mem_queue.top();
       mstate.request_mem_queue.pop();
 
       route_request(new_request);
@@ -295,7 +306,7 @@ void handle_client_request(Client_handle client_handle, const Request_msg& clien
   Request_msg worker_req(tag, client_req);
 
   mstate.clients.insert(std::make_pair(tag,
-    std::tuple<Client_handle, float, Request_msg>(client_handle, time, worker_req)));
+    std::make_tuple(client_handle, time, worker_req)));
 
   // Fire off the request to the worker.  Eventually the worker will
   // respond, and your 'handle_worker_response' event handler will be
@@ -321,7 +332,7 @@ void handle_client_request(Client_handle client_handle, const Request_msg& clien
 
         // send_request_to_worker(get_best_worker(false), dummy_req);
         mstate.clients.insert(std::make_pair(tag,
-          std::tuple<Client_handle, float, Request_msg>(client_handle, time, dummy_req)));
+          std::make_tuple(client_handle, time, dummy_req)));
       }
     }
 
@@ -353,6 +364,12 @@ void handle_client_request(Client_handle client_handle, const Request_msg& clien
 
 }
 
+#define MIN_CPU_MULT 2
+#define MIN_MEM_MULT 2
+
+#define MAX_CPU_MULT 0.5f
+#define MAX_MEM_MULT 0.5f
+
 
 void handle_tick() {
 
@@ -361,6 +378,61 @@ void handle_tick() {
   // TODO: you may wish to take action here.  This method is called at
   // fixed time intervals, according to how you set 'tick_period' in
   // 'master_node_init'.
+
+  // Kill any workers that are marked for deletion and have no more jobs to complete
+  std::remove_if(std::begin(mstate.workers), std::end(mstate.workers), [](worker_t worker) {
+    if (std::get<3>(worker) && (std::get<1>(worker) + std::get<2>(worker)) == 0) {
+      kill_worker_node(std::get<0>(worker));
+      return true;
+    }
+    return false;
+  });
+
+  int live_workers = std::count_if(std::begin(mstate.workers), std::end(mstate.workers), [](const worker_t& worker) {
+    return !std::get<3>(worker);
+  });
+
+  int cpu_throughput = live_workers * MAX_CPU_REQUESTS;
+  int mem_throughput = live_workers * MAX_MEM_REQUESTS;
+
+  // If both job queues are small compared to live workers count and workers.size() > mstate.min_workers,
+  // mark the live worker with the fewest jobs for deletion
+
+  if (live_workers > mstate.min_workers &&
+      cpu_throughput > mstate.request_cpu_queue.size() * MIN_CPU_MULT &&
+      mem_throughput > mstate.request_mem_queue.size() * MIN_MEM_MULT) {
+
+    auto comparator = [&](worker_t a, worker_t b) {
+
+      // If either of the workers is dying, return the live one
+      if (std::get<3>(a) && !std::get<3>(b)) return false;
+      else if (std::get<3>(b) && !std::get<3>(a)) return true;
+
+      return (std::get<1>(a) + std::get<2>(a)) < (std::get<1>(b) + std::get<2>(b));
+    };
+
+    auto& worker_to_delete = *std::min_element(std::begin(mstate.workers), std::end(mstate.workers), comparator);
+    std::get<3>(worker_to_delete) = true;
+
+    DLOG(INFO) << "Deleting worker " << std::get<0>(worker_to_delete) << std::endl;
+  }
+
+  // If any job queue is large and workers.size() < mstate.max_workers, add (up to) 2 workers to handle a burst
+  else if ( live_workers < mstate.max_workers &&
+            cpu_throughput < mstate.request_cpu_queue.size() * MAX_CPU_MULT &&
+            mem_throughput < mstate.request_mem_queue.size() * MAX_MEM_MULT) {
+    int workers_to_add = std::min(2, (int) (mstate.max_workers - mstate.workers.size()));
+    for (int i = 0; i < workers_to_add; i++) {
+      int tag = random();
+      Request_msg req(tag);
+      req.set_arg("name", "my worker");
+      request_new_worker_node(req);
+    }
+
+    DLOG(INFO) << "Adding " << workers_to_add << "workers " << std::endl;
+
+  }
+
 
 }
 
