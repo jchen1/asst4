@@ -19,6 +19,7 @@ def listen_to(port):
 	  s = None
 	  continue
       try:
+	  s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 	  s.bind(sa)
 	  s.listen(1)
       except socket.error as msg:

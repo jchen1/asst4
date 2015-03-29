@@ -31,14 +31,11 @@ if [ $MASTER.local = $HOSTNAME ] ; then
 
   # Start the launcher and sleep a moment to make sure it is listening.
   ./scripts/nodemanager_local.py --nodefile $PBS_NODEFILE 6666 --log_dir=logs.$JOBNAME $debug_cflags $configflags &
-
   nodemanager_pid=$!
-  sleep .5
 
   # Start the master and sleep a moment to make sure it is listening.
   ./master --max_workers $NUM_WORKERS --address=$(hostname):15418 --log_dir=logs.$JOBNAME $debug_cflags $(hostname):6666 &
   master_pid=$!
-  sleep .5
 
   function cleanup_processes {
 
@@ -56,7 +53,7 @@ if [ $MASTER.local = $HOSTNAME ] ; then
     done
   }
 
-  trap cleanup_processes SIGINT
+  trap cleanup_processes SIGINT SIGTERM SIGKILL
 
   # Run the test harness (this python script generates all the requests
   # and verifies the correctness of the server's responses)

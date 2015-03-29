@@ -44,8 +44,11 @@ int main(int argc, char** argv) {
   CHECK_GE(accept_fd, 0) << "Could not listen on " << FLAGS_address;
   DLOG_IF(INFO, FLAGS_log_network) << "Listening on " << FLAGS_address;
 
-  launcher_fd = connect_to(argv[1]);
-  CHECK_GE(launcher_fd, 0) << "Could not connect to launcher " << argv[1];
+  DLOG_IF(INFO, FLAGS_log_network) << "Waiting for launcher " << argv[1];
+  while (launcher_fd < 0) {
+    sleep(1);
+    launcher_fd = connect_to(argv[1]);
+  }
   DLOG_IF(INFO, FLAGS_log_network) << "Connected to launcher at " << argv[1];
 
   // Tell the launcher what address we are listening on.
