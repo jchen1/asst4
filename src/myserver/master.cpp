@@ -20,8 +20,8 @@ using worker_t = std::tuple<Worker_handle, int, int, bool>;
 #define MIN_CPU_MULT 2
 #define MIN_MEM_MULT 2
 
-#define MAX_CPU_MULT 3
-#define MAX_MEM_MULT 3
+#define MAX_CPU_MULT 4
+#define MAX_MEM_MULT 4
 
 static bool compare_request_priorities(Request_msg a, Request_msg b) {
   if (a.get_arg("cmd") == "tellmenow" && b.get_arg("cmd") != "tellmenow") {
@@ -68,6 +68,8 @@ static struct Master_state {
   // Vector of tuple (worker, pending cpu requests, pending mem requests, worker dying)
   std::vector<worker_t> workers;
 
+  int pending_workers;
+
 } mstate;
 
 
@@ -91,7 +93,7 @@ void calc_and_send_compareprimes(Client_handle client_handle, const Request_msg&
   params[2] = atoi(client_req.get_arg("n3").c_str());
   params[3] = atoi(client_req.get_arg("n4").c_str());
 
-  DLOG(INFO) << "Fulfilling compareprimes request " << client_req.get_tag() << ": (" << params[0] << ", " << params[1] << ", " << params[2] << ", " << params[3] << ")\n";
+  // DLOG(INFO) << "Fulfilling compareprimes request " << client_req.get_tag() << ": (" << params[0] << ", " << params[1] << ", " << params[2] << ", " << params[3] << ")\n";
 
   std::transform(params, params + 4, counts, [&](const int param) {
     return mstate.primes.at(param);
@@ -116,6 +118,7 @@ void master_node_init(int max_workers, int& tick_period) {
   mstate.next_tag = 0;
   mstate.min_workers = 1;
   mstate.max_workers = max_workers;
+  mstate.pending_workers = 0;
   mstate.incoming_rate = 0.0f;
   mstate.outgoing_rate = 0.0f;
 
@@ -134,6 +137,7 @@ void master_node_init(int max_workers, int& tick_period) {
 
   // start with the minimum number of workers
   for (int i = 0; i < mstate.min_workers; i++) {
+    mstate.pending_workers++;
     int tag = random();
     Request_msg req(tag);
     req.set_arg("name", "my worker");
@@ -197,10 +201,12 @@ void handle_new_worker_online(Worker_handle worker_handle, int tag) {
   // corresponds to.  Since the starter code only sends off one new
   // worker request, we don't use it here.
 
-  DLOG(INFO) << "New worker online!\n";
+  // DLOG(INFO) << "New worker online!\n";
 
   // Now that the worker is online, saturate it with requests from the queue
   int cpu_requests = 0, mem_requests = 0;
+
+  mstate.pending_workers--;
 
   while (mem_requests <= MAX_MEM_REQUESTS && !mstate.request_mem_queue.empty()) {
     auto request = mstate.request_mem_queue.top();
@@ -234,7 +240,7 @@ void handle_worker_response(Worker_handle worker_handle, const Response_msg& res
 
   int tag = resp.get_tag();
 
-  DLOG(INFO) << "Master received a response from a worker: [" << tag << ":" << resp.get_response() << "]" << std::endl;
+  // DLOG(INFO) << "Master received a response from a worker: [" << tag << ":" << resp.get_response() << "]" << std::endl;
 
   Client_handle waiting_client;
   float request_time;
@@ -335,7 +341,7 @@ void handle_client_request(Client_handle client_handle, const Request_msg& clien
     mstate.next_tag = tag + 5;
   }
 
-  DLOG(INFO) << "Received request[" << tag << "]: " << client_req.get_request_string() << std::endl;
+  // DLOG(INFO) << "Received request[" << tag << "]: " << client_req.get_request_string() << std::endl;
 
   Request_msg worker_req(tag, client_req);
 
@@ -397,25 +403,13 @@ void handle_client_request(Client_handle client_handle, const Request_msg& clien
 }
 
 void handle_tick() {
-  DLOG(INFO) << "CPU queue size: " << mstate.request_cpu_queue.size() << ", MEM queue size: " << mstate.request_mem_queue.size() << std::endl;
-
-  // Kill any workers that are marked for deletion and have no more jobs to complete
-  auto new_end = std::remove_if(std::begin(mstate.workers), std::end(mstate.workers), [](worker_t worker) {
-    if (std::get<3>(worker) && (std::get<1>(worker) + std::get<2>(worker)) == 0) {
-      DLOG(INFO) << "Deleting worker " << std::get<0>(worker) << std::endl;
-      kill_worker_node(std::get<0>(worker));
-      return true;
-    }
-    return false;
-  });
-
-  mstate.workers.erase(new_end, std::end(mstate.workers));
+  // DLOG(INFO) << "CPU queue size: " << mstate.request_cpu_queue.size() << ", MEM queue size: " << mstate.request_mem_queue.size() << std::endl;
 
   int live_workers = std::count_if(std::begin(mstate.workers), std::end(mstate.workers), [](const worker_t& worker) {
     return (std::get<3>(worker) == false);
   });
 
-  DLOG(INFO) << live_workers << " live workers" << std::endl;
+  // DLOG(INFO) << live_workers << " live workers" << std::endl;
 
   int cpu_throughput = live_workers * MAX_CPU_REQUESTS;
   int mem_throughput = live_workers * MAX_MEM_REQUESTS;
@@ -439,20 +433,18 @@ void handle_tick() {
     auto& worker_to_delete = *std::min_element(std::begin(mstate.workers), std::end(mstate.workers), comparator);
     std::get<3>(worker_to_delete) = true;
 
-    DLOG(INFO) << "Marking worker " << std::get<0>(worker_to_delete) << " for deletion" << std::endl;
+    // DLOG(INFO) << "Marking worker " << std::get<0>(worker_to_delete) << " for deletion" << std::endl;
   }
 
   // If any job queue is large and live_workers < mstate.max_workers, add (up to) 2 workers to handle a burst
   else if ( live_workers < mstate.max_workers &&
             (cpu_throughput < mstate.request_cpu_queue.size() * MAX_CPU_MULT ||
             mem_throughput < mstate.request_mem_queue.size() * MAX_MEM_MULT)) {
-    int workers_to_add = std::min(2, (int) (mstate.max_workers - mstate.workers.size()));
+    int workers_to_add = std::min(2, (int) (mstate.max_workers - (live_workers + mstate.pending_workers)));
 
+    // Returns a if a is dying, otherwise returns b
     auto comparator = [&](worker_t a, worker_t b) {
-      if (std::get<3>(a) && !std::get<3>(b)) return true;
-      else if (std::get<3>(b) && !std::get<3>(a)) return false;
-
-      return true;
+      return std::get<3>(a);
     };
 
     for (int i = 0; i < workers_to_add; i++) {
@@ -462,14 +454,25 @@ void handle_tick() {
         std::get<3>(worker_to_live) = false;
       }
       // Otherwise, grab a new one iff mstate.workers.size() < mstate.max_workers
-      else if (mstate.workers.size() < mstate.max_workers) {
+      else if (mstate.workers.size() + mstate.pending_workers < mstate.max_workers) {
         int tag = random();
         Request_msg req(tag);
         req.set_arg("name", "my worker");
         request_new_worker_node(req);
+        mstate.pending_workers++;
       }
     }
   }
+
+  // Kill any workers that are marked for deletion and have no more jobs to complete
+  mstate.workers.erase(std::remove_if(std::begin(mstate.workers), std::end(mstate.workers), [](worker_t worker) {
+    if (std::get<3>(worker) && (std::get<1>(worker) + std::get<2>(worker)) == 0) {
+      // DLOG(INFO) << "Deleting worker " << std::get<0>(worker) << std::endl;
+      kill_worker_node(std::get<0>(worker));
+      return true;
+    }
+    return false;
+  }), std::end(mstate.workers));
 
 
 }

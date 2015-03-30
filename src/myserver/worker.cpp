@@ -46,7 +46,7 @@ void worker_handle_request(const Request_msg& req) {
 
   // Output debugging help to the logs (in a single worker node
   // configuration, this would be in the log logs/worker.INFO)
-  DLOG(INFO) << "Worker got request: [" << req.get_tag() << ":" << req.get_request_string() << "]\n";
+  // DLOG(INFO) << "Worker got request: [" << req.get_tag() << ":" << req.get_request_string() << "]\n";
 
   // Add the task to the threadpool.
   wstate.tp.add_task([req]{
@@ -56,19 +56,15 @@ void worker_handle_request(const Request_msg& req) {
       bool old_use_first_cpu = wstate.use_first_cpu.load(std::memory_order_relaxed);
       while (!wstate.use_first_cpu.compare_exchange_weak(old_use_first_cpu, !old_use_first_cpu));
 
-      DLOG(INFO) << "Setting affinity to processor " << (old_use_first_cpu ? 0 : 1) << std::endl;
       cpu_set_t cpuset;
       CPU_ZERO(&cpuset);
       CPU_SET(old_use_first_cpu ? 0 : 1, &cpuset);
 
-      auto err = pthread_setaffinity_np(pthread_self(), CPU_SETSIZE, &cpuset);
-      if (err) {
-        DLOG(INFO) << "Error " << err << " setting processor affinity!\n";
-      }
+      pthread_setaffinity_np(pthread_self(), CPU_SETSIZE, &cpuset);
     }
     execute_work(req, resp);
     double dt = CycleTimer::currentSeconds() - startTime;
-    DLOG(INFO) << "Worker completed work in " << (1000.f * dt) << " ms (" << req.get_tag()  << ", " << resp.get_response() << ")\n";
+    // DLOG(INFO) << "Worker completed work in " << (1000.f * dt) << " ms (" << req.get_tag()  << ", " << resp.get_response() << ")\n";
 
     // send a response string to the master
     worker_send_response(resp);
