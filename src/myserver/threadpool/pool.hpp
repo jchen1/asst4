@@ -65,11 +65,11 @@ class pool
      * If all created threads are executing tasks and we have not spawned the
      * maximum number of allowed threads, create a new thread.
      */
-    if (threads_created == threads_running && threads_created != max_threads)
-    {
-      std::lock_guard<std::mutex> thread_lock(thread_mutex);
-      threads.emplace_back(std::bind(&pool::run_task, this));
-    }
+    // if (threads_created == threads_running && threads_created != max_threads)
+    // {
+    //   std::lock_guard<std::mutex> thread_lock(thread_mutex);
+    //   threads.emplace_back(std::bind(&pool::run_task, this));
+    // }
     auto p_task = std::make_shared<std::packaged_task<R()>>(
       std::bind(std::forward<T>(task), std::forward<Args>(args)...));
     {
@@ -198,10 +198,10 @@ class pool
         t();
         --threads_running;
 
-        if (!threads_running && empty())
-        {
-          task_empty.notify_all();
-        }
+        // if (!threads_running && empty())
+        // {
+        //   task_empty.notify_all();
+        // }
       }
       else
       {
@@ -210,12 +210,12 @@ class pool
     }
     --threads_created;
 
-    if (std::unique_lock<std::mutex>(thread_mutex, std::try_to_lock))
-    {
-      threads.remove_if([] (const worker_thread& thread) {
-        return !thread;
-      });
-    }
+    // if (std::unique_lock<std::mutex>(thread_mutex, std::try_to_lock))
+    // {
+    //   threads.remove_if([] (const worker_thread& thread) {
+    //     return !thread;
+    //   });
+    // }
   }
 
   std::list<worker_thread> threads;

@@ -5,10 +5,13 @@
 #include <sstream>
 #include <glog/logging.h>
 
+#include <atomic>
+
 #include "server/messages.h"
 #include "server/worker.h"
 #include "tools/cycle_timer.h"
 #include "threadpool/pool.hpp"
+#include <pthread.h>
 
 static struct Worker_state {
 
@@ -18,6 +21,9 @@ static struct Worker_state {
   // code.
 
   threadpool::pool tp;
+
+  std::atomic<bool> use_first_cpu;
+
 } wstate;
 
 void worker_node_init(const Request_msg& params) {
@@ -26,6 +32,8 @@ void worker_node_init(const Request_msg& params) {
   // might initialize a few data structures, or maybe even spawn a few
   // pthreads here.  Remember, when running on Amazon servers, worker
   // processes will run on an instance with a dual-core CPU.
+
+  wstate.use_first_cpu = true;
 
   DLOG(INFO) << "**** Initializing worker: " << params.get_arg("name") << " ****\n";
 
@@ -41,9 +49,23 @@ void worker_handle_request(const Request_msg& req) {
   DLOG(INFO) << "Worker got request: [" << req.get_tag() << ":" << req.get_request_string() << "]\n";
 
   // Add the task to the threadpool.
-  wstate.tp.add_task([=]{
+  wstate.tp.add_task([req]{
     Response_msg resp(req.get_tag());
     double startTime = CycleTimer::currentSeconds();
+    if (req.get_arg("cmd") == "projectidea") {
+      bool old_use_first_cpu = wstate.use_first_cpu.load(std::memory_order_relaxed);
+      while (!wstate.use_first_cpu.compare_exchange_weak(old_use_first_cpu, !old_use_first_cpu));
+
+      DLOG(INFO) << "Setting affinity to processor " << (old_use_first_cpu ? 0 : 1) << std::endl;
+      cpu_set_t cpuset;
+      CPU_ZERO(&cpuset);
+      CPU_SET(old_use_first_cpu ? 0 : 1, &cpuset);
+
+      auto err = pthread_setaffinity_np(pthread_self(), CPU_SETSIZE, &cpuset);
+      if (err) {
+        DLOG(INFO) << "Error " << err << " setting processor affinity!\n";
+      }
+    }
     execute_work(req, resp);
     double dt = CycleTimer::currentSeconds() - startTime;
     DLOG(INFO) << "Worker completed work in " << (1000.f * dt) << " ms (" << req.get_tag()  << ", " << resp.get_response() << ")\n";

@@ -17,6 +17,12 @@ using worker_t = std::tuple<Worker_handle, int, int, bool>;
 #define MAX_MEM_REQUESTS 2
 #define MAX_CPU_REQUESTS 32
 
+#define MIN_CPU_MULT 2
+#define MIN_MEM_MULT 2
+
+#define MAX_CPU_MULT 3
+#define MAX_MEM_MULT 3
+
 static bool compare_request_priorities(Request_msg a, Request_msg b) {
   if (a.get_arg("cmd") == "tellmenow" && b.get_arg("cmd") != "tellmenow") {
     return true;
@@ -105,7 +111,7 @@ void master_node_init(int max_workers, int& tick_period) {
 
   // set up tick handler to fire every 5 seconds. (feel free to
   // configure as you please)
-  tick_period = 2;
+  tick_period = 1;
 
   mstate.next_tag = 0;
   mstate.min_workers = 1;
@@ -126,11 +132,13 @@ void master_node_init(int max_workers, int& tick_period) {
                               std::vector<Request_msg>,
                               decltype(&compare_request_priorities)>(&compare_request_priorities);
 
-  // fire off a request for a new worker
-  int tag = random();
-  Request_msg req(tag);
-  req.set_arg("name", "my worker");
-  request_new_worker_node(req);
+  // start with the minimum number of workers
+  for (int i = 0; i < mstate.min_workers; i++) {
+    int tag = random();
+    Request_msg req(tag);
+    req.set_arg("name", "my worker");
+    request_new_worker_node(req);
+  }
 
 }
 
@@ -166,6 +174,7 @@ void route_request(const Request_msg& request) {
     }
     else {
       send_request_to_worker(worker_handle, request);
+      std::get<1>(worker_tuple)++;
       std::get<2>(worker_tuple)++;
     }
   }
@@ -188,12 +197,34 @@ void handle_new_worker_online(Worker_handle worker_handle, int tag) {
   // corresponds to.  Since the starter code only sends off one new
   // worker request, we don't use it here.
 
-  mstate.workers.push_back(std::make_tuple(worker_handle, 0, 0, false));
+  DLOG(INFO) << "New worker online!\n";
+
+  // Now that the worker is online, saturate it with requests from the queue
+  int cpu_requests = 0, mem_requests = 0;
+
+  while (mem_requests <= MAX_MEM_REQUESTS && !mstate.request_mem_queue.empty()) {
+    auto request = mstate.request_mem_queue.top();
+    mstate.request_mem_queue.pop();
+
+    send_request_to_worker(worker_handle, request);
+    mem_requests++;
+    cpu_requests++;
+  }
+
+  while (cpu_requests <= MAX_CPU_REQUESTS && !mstate.request_cpu_queue.empty()) {
+    auto request = mstate.request_cpu_queue.top();
+    mstate.request_cpu_queue.pop();
+
+    send_request_to_worker(worker_handle, request);
+    cpu_requests++;
+  }
+
+  mstate.workers.emplace_back(worker_handle, cpu_requests, mem_requests, false);
 
   // Now that a worker is booted, let the system know the server is
   // ready to begin handling client requests.  The test harness will
   // now start its timers and start hitting your server with requests.
-  if (mstate.server_ready == false) {
+  if (mstate.server_ready == false && mstate.workers.size() >= mstate.min_workers) {
     mstate.server_ready = true;
     server_init_complete();
   }
@@ -214,23 +245,27 @@ void handle_worker_response(Worker_handle worker_handle, const Response_msg& res
     return std::get<0>(tuple) == worker_handle;
   }));
 
-  // If there is
   if (request.get_arg("cmd") == "projectidea") {
-    std::get<2>(worker_tuple)--;
     if (!mstate.request_mem_queue.empty()) {
       auto new_request = mstate.request_mem_queue.top();
       mstate.request_mem_queue.pop();
 
-      route_request(new_request);
+      send_request_to_worker(worker_handle, new_request);
+    }
+    else {
+      std::get<2>(worker_tuple)--;
+      std::get<1>(worker_tuple)--;
     }
   }
   else {
-    std::get<1>(worker_tuple)--;
     if (!mstate.request_cpu_queue.empty()) {
       auto new_request = mstate.request_cpu_queue.top();
       mstate.request_cpu_queue.pop();
 
-      route_request(new_request);
+      send_request_to_worker(worker_handle, new_request);
+    }
+    else {
+      std::get<1>(worker_tuple)--;
     }
   }
 
@@ -302,7 +337,6 @@ void handle_client_request(Client_handle client_handle, const Request_msg& clien
 
   DLOG(INFO) << "Received request[" << tag << "]: " << client_req.get_request_string() << std::endl;
 
-
   Request_msg worker_req(tag, client_req);
 
   mstate.clients.insert(std::make_pair(tag,
@@ -329,8 +363,6 @@ void handle_client_request(Client_handle client_handle, const Request_msg& clien
         create_computeprimes_req(dummy_req, params[i]);
         route_request(dummy_req);
 
-
-        // send_request_to_worker(get_best_worker(false), dummy_req);
         mstate.clients.insert(std::make_pair(tag,
           std::make_tuple(client_handle, time, dummy_req)));
       }
@@ -364,33 +396,26 @@ void handle_client_request(Client_handle client_handle, const Request_msg& clien
 
 }
 
-#define MIN_CPU_MULT 2
-#define MIN_MEM_MULT 2
-
-#define MAX_CPU_MULT 0.5f
-#define MAX_MEM_MULT 0.5f
-
-
 void handle_tick() {
-
-  // DLOG(INFO) << "Current queue sizes: CPU " << mstate.request_cpu_queue.size() << " MEM " << mstate.request_mem_queue.size() << std::endl;
-
-  // TODO: you may wish to take action here.  This method is called at
-  // fixed time intervals, according to how you set 'tick_period' in
-  // 'master_node_init'.
+  DLOG(INFO) << "CPU queue size: " << mstate.request_cpu_queue.size() << ", MEM queue size: " << mstate.request_mem_queue.size() << std::endl;
 
   // Kill any workers that are marked for deletion and have no more jobs to complete
-  std::remove_if(std::begin(mstate.workers), std::end(mstate.workers), [](worker_t worker) {
+  auto new_end = std::remove_if(std::begin(mstate.workers), std::end(mstate.workers), [](worker_t worker) {
     if (std::get<3>(worker) && (std::get<1>(worker) + std::get<2>(worker)) == 0) {
+      DLOG(INFO) << "Deleting worker " << std::get<0>(worker) << std::endl;
       kill_worker_node(std::get<0>(worker));
       return true;
     }
     return false;
   });
 
+  mstate.workers.erase(new_end, std::end(mstate.workers));
+
   int live_workers = std::count_if(std::begin(mstate.workers), std::end(mstate.workers), [](const worker_t& worker) {
-    return !std::get<3>(worker);
+    return (std::get<3>(worker) == false);
   });
+
+  DLOG(INFO) << live_workers << " live workers" << std::endl;
 
   int cpu_throughput = live_workers * MAX_CPU_REQUESTS;
   int mem_throughput = live_workers * MAX_MEM_REQUESTS;
@@ -414,23 +439,36 @@ void handle_tick() {
     auto& worker_to_delete = *std::min_element(std::begin(mstate.workers), std::end(mstate.workers), comparator);
     std::get<3>(worker_to_delete) = true;
 
-    DLOG(INFO) << "Deleting worker " << std::get<0>(worker_to_delete) << std::endl;
+    DLOG(INFO) << "Marking worker " << std::get<0>(worker_to_delete) << " for deletion" << std::endl;
   }
 
-  // If any job queue is large and workers.size() < mstate.max_workers, add (up to) 2 workers to handle a burst
+  // If any job queue is large and live_workers < mstate.max_workers, add (up to) 2 workers to handle a burst
   else if ( live_workers < mstate.max_workers &&
-            cpu_throughput < mstate.request_cpu_queue.size() * MAX_CPU_MULT &&
-            mem_throughput < mstate.request_mem_queue.size() * MAX_MEM_MULT) {
+            (cpu_throughput < mstate.request_cpu_queue.size() * MAX_CPU_MULT ||
+            mem_throughput < mstate.request_mem_queue.size() * MAX_MEM_MULT)) {
     int workers_to_add = std::min(2, (int) (mstate.max_workers - mstate.workers.size()));
+
+    auto comparator = [&](worker_t a, worker_t b) {
+      if (std::get<3>(a) && !std::get<3>(b)) return true;
+      else if (std::get<3>(b) && !std::get<3>(a)) return false;
+
+      return true;
+    };
+
     for (int i = 0; i < workers_to_add; i++) {
-      int tag = random();
-      Request_msg req(tag);
-      req.set_arg("name", "my worker");
-      request_new_worker_node(req);
+      // If there is a worker scheduled to die, unschedule it
+      auto& worker_to_live = *std::min_element(std::begin(mstate.workers), std::end(mstate.workers), comparator);
+      if (std::get<3>(worker_to_live)) {
+        std::get<3>(worker_to_live) = false;
+      }
+      // Otherwise, grab a new one iff mstate.workers.size() < mstate.max_workers
+      else if (mstate.workers.size() < mstate.max_workers) {
+        int tag = random();
+        Request_msg req(tag);
+        req.set_arg("name", "my worker");
+        request_new_worker_node(req);
+      }
     }
-
-    DLOG(INFO) << "Adding " << workers_to_add << "workers " << std::endl;
-
   }
 
 
